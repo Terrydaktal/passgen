@@ -3,7 +3,16 @@ set -eu
 
 ITERATIONS=100000
 DKLEN=64
-Z85_ALPHABET='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#'
+MODE="pbkdf2"
+
+usage() {
+  cat <<'EOF'
+Usage: passgen [--argon]
+
+Default mode uses PBKDF2-HMAC-SHA256 (OpenSSL).
+Use --argon to switch to Argon2id mode (argon2 CLI binary required).
+EOF
+}
 
 prompt_tty() {
   printf '%s' "$1" > /dev/tty
@@ -33,6 +42,38 @@ derive_key_bin() {
     -kdfopt "salt:$salt" \
     -kdfopt "iter:$ITERATIONS" \
     PBKDF2
+}
+
+derive_key_argon_bin() {
+  salt=$1
+  key_material=$2
+  time_cost=$3
+  mem_kib=$4
+  parallelism=$5
+  tmp=""
+
+  if ! command -v argon2 >/dev/null 2>&1; then
+    printf '%s\n' "Error: argon2 binary not found." >&2
+    printf '%s\n' "Install it (Debian/Ubuntu): sudo apt install argon2" >&2
+    return 1
+  fi
+
+  if [ "${#salt}" -lt 8 ]; then
+    printf '%s\n' "Error: combined Site+Username must be at least 8 characters for argon2 salt." > /dev/tty
+    return 1
+  fi
+
+  tmp=$(mktemp) || return 1
+  if ! printf '%s' "$key_material" \
+    | argon2 "$salt" -id -t "$time_cost" -k "$mem_kib" -p "$parallelism" -l "$DKLEN" -r > "$tmp"
+  then
+    rm -f "$tmp"
+    printf '%s\n' "Error: argon2 failed with the provided parameters." > /dev/tty
+    return 1
+  fi
+
+  cat "$tmp"
+  rm -f "$tmp"
 }
 
 z85_encode_stream() {
@@ -71,7 +112,48 @@ z85_encode_stream() {
     }'
 }
 
-if [ -z "${PASSGEN_PEPPER:-}" ]; then
+prompt_int_tty() {
+  name=$1
+  prompt=$2
+  minv=$3
+  maxv=$4
+
+  while :; do
+    s=$(prompt_tty "$prompt") || return 1
+    case "$s" in
+      ''|*[!0-9]*)
+        printf '%s\n' "Error: $name must be an integer between $minv and $maxv." > /dev/tty
+        continue
+        ;;
+    esac
+    if [ "$s" -lt "$minv" ] || [ "$s" -gt "$maxv" ]; then
+      printf '%s\n' "Error: $name must be between $minv and $maxv." > /dev/tty
+      continue
+    fi
+    printf '%s' "$s"
+    return 0
+  done
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --argon)
+      MODE="argon"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf '%s\n' "Error: unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [ "$MODE" = "pbkdf2" ] && [ -z "${PASSGEN_PEPPER:-}" ]; then
   printf '%s\n' "Error: PASSGEN_PEPPER environment variable is not set." >&2
   exit 1
 fi
@@ -83,7 +165,15 @@ fi
 
 site=$(prompt_tty "Site: ")
 username=$(prompt_tty "Username: ")
-master=$(prompt_secret_tty "Master Password: ")
+
+if [ "$MODE" = "argon" ]; then
+  master=$(prompt_secret_tty "Password: ")
+  time_cost=$(prompt_int_tty "Time" "Time: " 1 50)
+  mem_kib=$(prompt_int_tty "Memory" "Memory: " 8192 8388608)
+  parallelism=$(prompt_int_tty "Parallelism" "Parallelism: " 1 256)
+else
+  master=$(prompt_secret_tty "Master Password: ")
+fi
 
 enc=""
 while [ "$enc" != "64" ] && [ "$enc" != "85" ]; do
@@ -93,35 +183,51 @@ while [ "$enc" != "64" ] && [ "$enc" != "85" ]; do
   fi
 done
 
-if [ "$enc" = "85" ]; then
-  hint="Length (blank=full; hint: 44 or 80): "
-else
-  hint="Length (blank=full; hint: 20 or 86): "
-fi
-
-length_s=$(prompt_tty "$hint")
 length=""
-if [ -n "$length_s" ]; then
-  case "$length_s" in
-    *[!0-9]*)
+if [ "$MODE" = "pbkdf2" ]; then
+  if [ "$enc" = "85" ]; then
+    hint="Length (blank=full; hint: 44 or 80): "
+  else
+    hint="Length (blank=full; hint: 20 or 86): "
+  fi
+
+  length_s=$(prompt_tty "$hint")
+  if [ -n "$length_s" ]; then
+    case "$length_s" in
+      *[!0-9]*)
+        printf '%s\n' "Error: length must be a positive integer (or blank)." > /dev/tty
+        exit 2
+        ;;
+    esac
+    if [ "$length_s" -le 0 ]; then
       printf '%s\n' "Error: length must be a positive integer (or blank)." > /dev/tty
       exit 2
-      ;;
-  esac
-  if [ "$length_s" -le 0 ]; then
-    printf '%s\n' "Error: length must be a positive integer (or blank)." > /dev/tty
-    exit 2
+    fi
+    length="$length_s"
   fi
-  length="$length_s"
 fi
 
 salt="${site}${username}"
-key_material="${master}${PASSGEN_PEPPER}"
+key_material="${master}${PASSGEN_PEPPER:-}"
 
-if [ "$enc" = "64" ]; then
-  out=$(derive_key_bin "$salt" "$key_material" | base64 | tr -d '\n=')
+if [ "$MODE" = "argon" ]; then
+  raw_tmp=$(mktemp) || exit 1
+  if ! derive_key_argon_bin "$salt" "$key_material" "$time_cost" "$mem_kib" "$parallelism" > "$raw_tmp"; then
+    rm -f "$raw_tmp"
+    exit 1
+  fi
+  if [ "$enc" = "64" ]; then
+    out=$(base64 < "$raw_tmp" | tr -d '\n=')
+  else
+    out=$(z85_encode_stream < "$raw_tmp")
+  fi
+  rm -f "$raw_tmp"
 else
-  out=$(derive_key_bin "$salt" "$key_material" | z85_encode_stream)
+  if [ "$enc" = "64" ]; then
+    out=$(derive_key_bin "$salt" "$key_material" | base64 | tr -d '\n=')
+  else
+    out=$(derive_key_bin "$salt" "$key_material" | z85_encode_stream)
+  fi
 fi
 
 if [ -n "$length" ]; then

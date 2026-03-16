@@ -2,28 +2,28 @@
 
 Deterministic password/key generator for terminal use.
 
-`passgen` derives a stable secret from:
+`passgen` has two modes:
 
-- `site` (prompted)
-- `username` (prompted)
-- `master password` (hidden prompt)
-- `PASSGEN_PEPPER` (required env var)
+- `passgen` (default): PBKDF2-HMAC-SHA256 via `openssl kdf`
+- `passgen --argon`: Argon2id via the compiled `argon2` CLI binary
 
 It is designed so you can safely pipe the generated output (stdout) into other commands while keeping prompts on your terminal (`/dev/tty`).
 
 ## How It Works
 
-`passgen` is a POSIX `sh` script that:
+In both modes, `passgen`:
 
 1. Builds `salt = (site + username)` (UTF-8).
-2. Builds `key = (master password + PASSGEN_PEPPER)` (UTF-8).
-3. Runs `PBKDF2-HMAC-SHA256` via `openssl kdf` with:
-   - iterations: `100000`
-   - derived key length: `64` bytes
+2. Builds `key = (password + PASSGEN_PEPPER)` (UTF-8).
+3. Derives `64` bytes:
+   - default mode: `PBKDF2-HMAC-SHA256` via `openssl kdf` with:
+     - iterations: `100000`
+     - derived key length: `64` bytes
+   - `--argon` mode: `argon2 ... -id -t <time> -k <memory_kib> -p <parallelism> -l 64 -r`
 4. Encodes the derived bytes as either:
    - Base64 (unpadded; `=` removed), or
    - Z85 (ZeroMQ Base85 alphabet)
-5. Optionally truncates to the requested length.
+5. Default mode optionally truncates to the requested length.
 
 Important: `passgen` writes the result with **no trailing newline**.
 
@@ -34,6 +34,7 @@ Important: `passgen` writes the result with **no trailing newline**.
 - `awk`
 - `od`
 - `base64`
+- `argon2` binary (only for `--argon` mode)
 
 ## Installation
 
@@ -53,7 +54,9 @@ install -m 0755 ./passgen ~/.local/bin/passgen
 
 ## Setup: PASSGEN_PEPPER
 
-`PASSGEN_PEPPER` is required. Without it, `passgen` exits with an error.
+Default mode requires `PASSGEN_PEPPER`.
+
+`--argon` mode accepts `PASSGEN_PEPPER` as optional (empty if unset).
 
 The pepper should be:
 
@@ -78,13 +81,28 @@ Interactive usage:
 passgen
 ```
 
+Argon mode:
+
+```bash
+passgen --argon
+```
+
 You will be prompted for:
 
-- `Site`
-- `Username`
-- `Master Password` (hidden)
-- `Encoding` (`64` for Base64, `85` for Z85)
-- `Length` (blank for full output; otherwise truncate)
+- In default mode:
+  - `Site`
+  - `Username`
+  - `Master Password` (hidden)
+  - `Encoding` (`64` for Base64, `85` for Z85)
+  - `Length` (blank for full output; otherwise truncate)
+- In `--argon` mode:
+  - `Site`
+  - `Username`
+  - `Password` (hidden)
+  - `Time` (`1`..`50`)
+  - `Memory` KiB (`8192`..`8388608`)
+  - `Parallelism` (`1`..`256`)
+  - `Encoding` (`64` for Base64, `85` for Z85)
 
 Because prompts use `/dev/tty`, stdout is clean for piping:
 
@@ -105,7 +123,7 @@ With the default 64-byte derived key:
 - Base64 unpadded length: 86 characters
 - Z85 length: 80 characters
 
-The script suggests common truncation lengths at the prompt:
+Default mode suggests common truncation lengths at the prompt:
 
 - Z85: 44 or 80
 - Base64: 20 or 86
@@ -120,15 +138,19 @@ If a target system has strict password character rules, choose the encoding/leng
 ## Security Model and Caveats
 
 - Deterministic: the same inputs produce the same output.
-- If any of `site`, `username`, `master password`, or `PASSGEN_PEPPER` change, the output changes.
-- `PASSGEN_PEPPER` acts as an extra secret factor (separate from the master password). Treat it like a key.
+- If any inputs/parameters for a mode change, the output changes.
+- `PASSGEN_PEPPER` acts as an extra secret factor when set. Treat it like a key.
 - Truncation reduces strength. Prefer using full-length output where you can.
 - This is not a password manager: it does not store, sync, or rotate secrets. It only derives them.
 
 ## Troubleshooting
 
 - `Error: PASSGEN_PEPPER environment variable is not set.`:
-  - Export `PASSGEN_PEPPER` in your shell before running `passgen`.
+  - Export `PASSGEN_PEPPER` before running default mode (`passgen`).
+- `Error: argon2 binary not found.`:
+  - Install package `argon2` (Debian/Ubuntu: `sudo apt install argon2`).
+- `combined Site+Username must be at least 8 characters`:
+  - Argon2 salt input must be at least 8 chars.
 - `No /dev/tty available. Run from an interactive terminal.`:
   - Run from a real interactive TTY (not from a context that has no controlling terminal).
 - Pasting/clipboard tools appear to hang:
