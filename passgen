@@ -50,7 +50,8 @@ derive_key_argon_bin() {
   time_cost=$3
   mem_kib=$4
   parallelism=$5
-  tmp=""
+  expected_hex_len=$((DKLEN * 2))
+  hex=""
 
   if ! command -v argon2 >/dev/null 2>&1; then
     printf '%s\n' "Error: argon2 binary not found." >&2
@@ -63,21 +64,61 @@ derive_key_argon_bin() {
     return 1
   fi
 
-  tmp=$(mktemp) || return 1
-  if ! printf '%s' "$key_material" \
-    | argon2 "$salt" -id -t "$time_cost" -k "$mem_kib" -p "$parallelism" -l "$DKLEN" -r > "$tmp"
+  if ! hex=$(printf '%s' "$key_material" \
+    | argon2 "$salt" -id -t "$time_cost" -k "$mem_kib" -p "$parallelism" -l "$DKLEN" -r \
+    | tr -d '[:space:]')
   then
-    rm -f "$tmp"
     printf '%s\n' "Error: argon2 failed with the provided parameters." > /dev/tty
     return 1
   fi
 
-  cat "$tmp"
-  rm -f "$tmp"
+  case "$hex" in
+    ''|*[!0-9A-Fa-f]*)
+      printf '%s\n' "Error: argon2 returned invalid output." > /dev/tty
+      return 1
+      ;;
+  esac
+  if [ "${#hex}" -ne "$expected_hex_len" ]; then
+    printf '%s\n' "Error: argon2 returned unexpected output length." > /dev/tty
+    return 1
+  fi
+
+  if ! printf '%s' "$hex" | hex_to_bin_stream; then
+    printf '%s\n' "Error: failed to decode argon2 output." > /dev/tty
+    return 1
+  fi
 }
 
-z85_encode_stream() {
-  od -An -tx1 -v | tr -d ' \n' | awk '
+hex_to_bin_stream() {
+  LC_ALL=C awk '
+    function h2d(h, i, c, p, v) {
+      v=0
+      for (i=1; i<=length(h); i++) {
+        c=substr(h, i, 1)
+        p=index("0123456789abcdef", c)-1
+        v=v*16+p
+      }
+      return v
+    }
+    {
+      gsub(/[[:space:]]/, "", $0)
+      hex=hex tolower($0)
+    }
+    END {
+      if (length(hex) % 2 != 0) {
+        exit 2
+      }
+      if (hex ~ /[^0-9a-f]/) {
+        exit 2
+      }
+      for (i=1; i<=length(hex); i+=2) {
+        printf "%c", h2d(substr(hex, i, 2))
+      }
+    }'
+}
+
+z85_encode_hex_stream() {
+  LC_ALL=C awk '
     BEGIN {
       alpha="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#"
       pow4=85*85*85*85; pow3=85*85*85; pow2=85*85
@@ -92,8 +133,14 @@ z85_encode_stream() {
       return v
     }
     {
-      hex=tolower($0)
+      gsub(/[[:space:]]/, "", $0)
+      hex=hex tolower($0)
+    }
+    END {
       if (length(hex) % 8 != 0) {
+        exit 2
+      }
+      if (hex ~ /[^0-9a-f]/) {
         exit 2
       }
       for (i=1; i<=length(hex); i+=8) {
@@ -110,6 +157,10 @@ z85_encode_stream() {
           substr(alpha, d5+1, 1)
       }
     }'
+}
+
+z85_encode_stream() {
+  od -An -tx1 -v | z85_encode_hex_stream
 }
 
 prompt_int_tty() {
@@ -184,27 +235,19 @@ while [ "$enc" != "64" ] && [ "$enc" != "85" ]; do
 done
 
 length=""
-if [ "$MODE" = "pbkdf2" ]; then
-  if [ "$enc" = "85" ]; then
-    hint="Length (blank=full; hint: 44 or 80): "
-  else
-    hint="Length (blank=full; hint: 20 or 86): "
-  fi
-
-  length_s=$(prompt_tty "$hint")
-  if [ -n "$length_s" ]; then
-    case "$length_s" in
-      *[!0-9]*)
-        printf '%s\n' "Error: length must be a positive integer (or blank)." > /dev/tty
-        exit 2
-        ;;
-    esac
-    if [ "$length_s" -le 0 ]; then
+length_s=$(prompt_tty "Length (blank=full): ")
+if [ -n "$length_s" ]; then
+  case "$length_s" in
+    *[!0-9]*)
       printf '%s\n' "Error: length must be a positive integer (or blank)." > /dev/tty
       exit 2
-    fi
-    length="$length_s"
+      ;;
+  esac
+  if [ "$length_s" -le 0 ]; then
+    printf '%s\n' "Error: length must be a positive integer (or blank)." > /dev/tty
+    exit 2
   fi
+  length="$length_s"
 fi
 
 salt="${site}${username}"

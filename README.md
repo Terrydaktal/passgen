@@ -16,14 +16,12 @@ In both modes, `passgen`:
 1. Builds `salt = (site + username)` (UTF-8).
 2. Builds `key = (password + PASSGEN_PEPPER)` (UTF-8).
 3. Derives `64` bytes:
-   - default mode: `PBKDF2-HMAC-SHA256` via `openssl kdf` with:
-     - iterations: `100000`
-     - derived key length: `64` bytes
-   - `--argon` mode: `argon2 ... -id -t <time> -k <memory_kib> -p <parallelism> -l 64 -r`
+   - default mode: `PBKDF2-HMAC-SHA256` via `openssl kdf`
+   - `--argon` mode: `Argon2id` via `argon2`
 4. Encodes the derived bytes as either:
    - Base64 (unpadded; `=` removed), or
    - Z85 (ZeroMQ Base85 alphabet)
-5. Default mode optionally truncates to the requested length.
+5. Optionally truncates to the requested length.
 
 Important: `passgen` writes the result with **no trailing newline**.
 
@@ -89,20 +87,18 @@ passgen --argon
 
 You will be prompted for:
 
+- In both modes:
+  - `Site`
+  - `Username`
+  - `Encoding` (`64` for Base64, `85` for Z85)
+  - `Length` (blank for full output)
 - In default mode:
-  - `Site`
-  - `Username`
   - `Master Password` (hidden)
-  - `Encoding` (`64` for Base64, `85` for Z85)
-  - `Length` (blank for full output; otherwise truncate)
 - In `--argon` mode:
-  - `Site`
-  - `Username`
   - `Password` (hidden)
-  - `Time` (`1`..`50`)
-  - `Memory` KiB (`8192`..`8388608`)
-  - `Parallelism` (`1`..`256`)
-  - `Encoding` (`64` for Base64, `85` for Z85)
+  - `Time`
+  - `Memory` KiB
+  - `Parallelism`
 
 Because prompts use `/dev/tty`, stdout is clean for piping:
 
@@ -122,11 +118,6 @@ With the default 64-byte derived key:
 
 - Base64 unpadded length: 86 characters
 - Z85 length: 80 characters
-
-Default mode suggests common truncation lengths at the prompt:
-
-- Z85: 44 or 80
-- Base64: 20 or 86
 
 ## Encoding Notes
 
