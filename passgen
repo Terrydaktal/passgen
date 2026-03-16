@@ -1,95 +1,132 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-python3 - <<'PY'
-import base64
-import getpass
-import hashlib
-import os
-import sys
+ITERATIONS=100000
+DKLEN=64
+Z85_ALPHABET='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#'
 
-Z85_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#"
+prompt_tty() {
+  printf '%s' "$1" > /dev/tty
+  IFS= read -r ans < /dev/tty || return 1
+  printf '%s' "$ans"
+}
 
-pepper_env = os.environ.get("PASSGEN_PEPPER")
-if not pepper_env:
-    # Print directly to stderr to ensure visibility even if stdout is piped
-    sys.stderr.write("Error: PASSGEN_PEPPER environment variable is not set.\n")
-    sys.exit(1)
+prompt_secret_tty() {
+  printf '%s' "$1" > /dev/tty
+  oldstty=$(stty -g < /dev/tty) || return 1
+  stty -echo < /dev/tty || return 1
+  IFS= read -r ans < /dev/tty || {
+    stty "$oldstty" < /dev/tty
+    return 1
+  }
+  stty "$oldstty" < /dev/tty
+  printf '\n' > /dev/tty
+  printf '%s' "$ans"
+}
 
-PEPPER = pepper_env.encode("utf-8")
-ITERATIONS = 100_000
-DKLEN = 64  # bytes
+derive_key_bin() {
+  salt=$1
+  key_material=$2
+  openssl kdf -binary -keylen "$DKLEN" \
+    -kdfopt digest:SHA256 \
+    -kdfopt "pass:$key_material" \
+    -kdfopt "salt:$salt" \
+    -kdfopt "iter:$ITERATIONS" \
+    PBKDF2
+}
 
-def z85_encode(data: bytes) -> str:
-    if len(data) % 4 != 0:
-        raise ValueError("Z85 encoding requires input length to be a multiple of 4.")
-    out = []
-    for i in range(0, len(data), 4):
-        v = int.from_bytes(data[i:i+4], "big", signed=False)
-        out.append(Z85_ALPHABET[(v // (85 ** 4)) % 85])
-        out.append(Z85_ALPHABET[(v // (85 ** 3)) % 85])
-        out.append(Z85_ALPHABET[(v // (85 ** 2)) % 85])
-        out.append(Z85_ALPHABET[(v // 85) % 85])
-        out.append(Z85_ALPHABET[v % 85])
-    return "".join(out)
+z85_encode_stream() {
+  od -An -tx1 -v | tr -d ' \n' | awk '
+    BEGIN {
+      alpha="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#"
+      pow4=85*85*85*85; pow3=85*85*85; pow2=85*85
+    }
+    function h2d(h, i, c, p, v) {
+      v=0
+      for (i=1; i<=length(h); i++) {
+        c=substr(h, i, 1)
+        p=index("0123456789abcdef", c)-1
+        v=v*16+p
+      }
+      return v
+    }
+    {
+      hex=tolower($0)
+      if (length(hex) % 8 != 0) {
+        exit 2
+      }
+      for (i=1; i<=length(hex); i+=8) {
+        v=h2d(substr(hex, i, 8))
+        d1=int(v/pow4); v-=d1*pow4
+        d2=int(v/pow3); v-=d2*pow3
+        d3=int(v/pow2); v-=d3*pow2
+        d4=int(v/85); d5=v-d4*85
+        printf "%s%s%s%s%s", \
+          substr(alpha, d1+1, 1), \
+          substr(alpha, d2+1, 1), \
+          substr(alpha, d3+1, 1), \
+          substr(alpha, d4+1, 1), \
+          substr(alpha, d5+1, 1)
+      }
+    }'
+}
 
-def prompt_tty(prompt: str) -> str:
-    # Keep stdout clean for piping; interact via controlling terminal.
-    if not (os.path.exists("/dev/tty") and os.access("/dev/tty", os.R_OK | os.W_OK)):
-        raise RuntimeError("No /dev/tty available. Run from an interactive terminal.")
-    with open("/dev/tty", "r", encoding="utf-8", errors="replace") as tin, \
-         open("/dev/tty", "w", encoding="utf-8", errors="replace") as tout:
-        tout.write(prompt)
-        tout.flush()
-        return tin.readline().rstrip("\n")
+if [ -z "${PASSGEN_PEPPER:-}" ]; then
+  printf '%s\n' "Error: PASSGEN_PEPPER environment variable is not set." >&2
+  exit 1
+fi
 
-def main() -> int:
-    site = prompt_tty("Site: ")
-    username = prompt_tty("Username: ")
-    master = getpass.getpass("Master Password: ")
+if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+  printf '%s\n' "Error: No /dev/tty available. Run from an interactive terminal." >&2
+  exit 1
+fi
 
-    enc = ""
-    while enc not in ("64", "85"):
-        enc = prompt_tty("Encoding (64 Base64, 85 Z85): ").strip()
-        if enc not in ("64", "85"):
-            with open("/dev/tty", "w", encoding="utf-8", errors="replace") as tout:
-                tout.write("Error: encoding must be 64 or 85.\n")
-                tout.flush()
+site=$(prompt_tty "Site: ")
+username=$(prompt_tty "Username: ")
+master=$(prompt_secret_tty "Master Password: ")
 
-    hint = "Length (blank=full; hint: 44 or 80): " if enc == "85" else "Length (blank=full; hint: 20 or 86): "
-    length_s = prompt_tty(hint).strip()
-    length = None
-    if length_s:
-        if not length_s.isdigit() or int(length_s) <= 0:
-            with open("/dev/tty", "w", encoding="utf-8", errors="replace") as tout:
-                tout.write("Error: length must be a positive integer (or blank).\n")
-                tout.flush()
-            return 2
-        length = int(length_s)
+enc=""
+while [ "$enc" != "64" ] && [ "$enc" != "85" ]; do
+  enc=$(prompt_tty "Encoding (64 Base64, 85 Z85): ")
+  if [ "$enc" != "64" ] && [ "$enc" != "85" ]; then
+    printf '%s\n' "Error: encoding must be 64 or 85." > /dev/tty
+  fi
+done
 
-    salt = (site + username).encode("utf-8")
-    key = master.encode("utf-8") + PEPPER
-    dk = hashlib.pbkdf2_hmac("sha256", key, salt, ITERATIONS, dklen=DKLEN)
+if [ "$enc" = "85" ]; then
+  hint="Length (blank=full; hint: 44 or 80): "
+else
+  hint="Length (blank=full; hint: 20 or 86): "
+fi
 
-    if enc == "64":
-        out = base64.b64encode(dk).decode("ascii").rstrip("=")
-    else:
-        out = z85_encode(dk)
+length_s=$(prompt_tty "$hint")
+length=""
+if [ -n "$length_s" ]; then
+  case "$length_s" in
+    *[!0-9]*)
+      printf '%s\n' "Error: length must be a positive integer (or blank)." > /dev/tty
+      exit 2
+      ;;
+  esac
+  if [ "$length_s" -le 0 ]; then
+    printf '%s\n' "Error: length must be a positive integer (or blank)." > /dev/tty
+    exit 2
+  fi
+  length="$length_s"
+fi
 
-    if length is not None:
-        out = out[:length]
+salt="${site}${username}"
+key_material="${master}${PASSGEN_PEPPER}"
 
-    # IMPORTANT: do NOT add a newline.
-    # With cryptsetup --key-file -, reading does not stop at newline characters. 2
-    try:
-        sys.stdout.write(out)
-        sys.stdout.flush()
-    except BrokenPipeError:
-        # Python ignores SIGPIPE by default and turns it into BrokenPipeError. 3
-        # Exit quietly if downstream closed early.
-        return 0
+if [ "$enc" = "64" ]; then
+  out=$(derive_key_bin "$salt" "$key_material" | base64 | tr -d '\n=')
+else
+  out=$(derive_key_bin "$salt" "$key_material" | z85_encode_stream)
+fi
 
-    return 0
+if [ -n "$length" ]; then
+  out=$(printf '%s' "$out" | cut -c1-"$length")
+fi
 
-raise SystemExit(main())
-PY
+# IMPORTANT: do NOT add a newline.
+printf '%s' "$out"

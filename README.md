@@ -13,11 +13,11 @@ It is designed so you can safely pipe the generated output (stdout) into other c
 
 ## How It Works
 
-`passgen` runs an embedded Python program that:
+`passgen` is a POSIX `sh` script that:
 
 1. Builds `salt = (site + username)` (UTF-8).
 2. Builds `key = (master password + PASSGEN_PEPPER)` (UTF-8).
-3. Runs `PBKDF2-HMAC-SHA256` with:
+3. Runs `PBKDF2-HMAC-SHA256` via `openssl kdf` with:
    - iterations: `100000`
    - derived key length: `64` bytes
 4. Encodes the derived bytes as either:
@@ -29,8 +29,11 @@ Important: `passgen` writes the result with **no trailing newline**.
 
 ## Requirements
 
-- `bash`
-- `python3`
+- POSIX `sh`
+- `openssl` 3.x (`openssl kdf`)
+- `awk`
+- `od`
+- `base64`
 
 ## Installation
 
@@ -62,11 +65,7 @@ The pepper should be:
 Example (generate a pepper once, store it somewhere secure, then export it):
 
 ```bash
-export PASSGEN_PEPPER="$(python3 - <<'PY'
-import secrets
-print(secrets.token_urlsafe(48))
-PY
-)"
+export PASSGEN_PEPPER="$(openssl rand -base64 48 | tr -d '\n')"
 ```
 
 Avoid hard-coding the pepper into shell history or world-readable dotfiles.
@@ -134,4 +133,3 @@ If a target system has strict password character rules, choose the encoding/leng
   - Run from a real interactive TTY (not from a context that has no controlling terminal).
 - Pasting/clipboard tools appear to hang:
   - Remember the output has no newline; add `; echo` if a newline is required for your workflow.
-
